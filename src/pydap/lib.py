@@ -315,10 +315,24 @@ def hyperslab(slice_):
     while slice_ and slice_[-1] == slice(None):
         slice_.pop(-1)
 
-    return "".join(
-        "[%s:%s:%s]" % (s.start or 0, s.step or 1, (s.stop or MAXSIZE) - 1)
-        for s in slice_
-    )
+    out = []
+    for s in slice_:
+        start = s.start or 0
+        step = s.step or 1
+        stop = s.stop
+        # An explicitly empty positive-step slice (e.g. slice(1, 1) or
+        # slice(3, 0)) has no elements. DAP hyperslabs use inclusive indices
+        # and cannot represent emptiness, so emit a contradictory hyperslab
+        # whose resulting array is empty rather than silently returning the
+        # whole dimension. The historical slice(0) spelling (start omitted,
+        # stop == 0) keeps its legacy MAXSIZE semantics. Negative-step slices
+        # are resolved by the multi-file proxy before reaching a server.
+        explicit_start = s.start is not None
+        if step > 0 and stop is not None and explicit_start and start >= stop:
+            out.append("[%s:%s:%s]" % (start, step, start - step))
+        else:
+            out.append("[%s:%s:%s]" % (start, step, (stop or MAXSIZE) - 1))
+    return "".join(out)
 
 
 def walk(var, type=object):

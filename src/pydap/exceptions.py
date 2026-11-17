@@ -51,3 +51,24 @@ class OpenFileError(HandlerError):
     """Exception raised when unable to open a file."""
 
     pass
+
+
+class DAP4ChecksumError(ServerError):
+    """Exception raised when a DAP4 variable checksum does not match the
+    checksum computed from the received binary payload."""
+
+    pass
+
+
+class DAP4TruncatedResponseError(ServerError):
+    """Exception raised when a DAP4 binary response ends before all the
+    variables described by its DMR have been decoded."""
+
+    pass
+
+
+class BufferLimitExceededError(ClientError):
+    """Exception raised when a single required observation slice is larger
+    than the configured dynamic data buffer budget."""
+
+    pass

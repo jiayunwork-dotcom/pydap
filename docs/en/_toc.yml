@@ -35,6 +35,7 @@ parts:
   chapters:
   - file: PydapAsClient
     sections:
+    - file: multifile
     - file: DAP_Protocol
     - file: ConstraintExpressions
   - file: responses.rst

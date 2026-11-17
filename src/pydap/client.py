@@ -290,15 +290,26 @@ def consolidate_metadata(
         raise ValueError(
             "URLs must have the same scheme. Try again with the same protocol."
         )
-    if not scheme.pop() == "dap4":
+    scheme = set(schemes)
+    if len(scheme) > 1:
+        raise ValueError(
+            "URLs must have the same scheme. Try again with the same protocol."
+        )
+    selected_scheme = scheme.pop()
+    if selected_scheme == "dap4":
+        # All URLs begin with dap4 - to make sure DAP4 compliant
+        URLs = ["https" + urls[i][len("dap4:") :] for i in range(len(urls))]
+    elif selected_scheme == "http":
+        # Plain HTTP is accepted for local test sources.
+        URLs = list(urls)
+    else:
         warnings.warn(
-            "URLs must be a dap4 URL and begin with `dap4://`. To "
-            " learn about da4p2 urls, please visit the following link: \n "
+            "URLs must be a dap4 URL and begin with `dap4://` (or `http://` "
+            "for local test sources). To learn about dap4 urls, please visit "
+            "the following link: \n "
             " https://pydap.github.io/pydap/en/faqs/dap2_or_dap4_url.html"
         )
         return None
-    # All URLs begin with dap4 - to make sure DAP4 compliant
-    URLs = ["https" + urls[i][4:] for i in range(len(urls))]
     dmr_urls = [
         url + ".dmr" if "?" not in url else url.replace("?", ".dmr?") for url in URLs
     ]
@@ -317,6 +328,13 @@ def consolidate_metadata(
                 ". Please check the URLs and try again."
             )
             return None
+        # Equal dimension *lengths* are necessary but not sufficient: the
+        # coordinate values must also agree. Download each non-concat
+        # coordinate variable and compare it against the first granule. This
+        # is the safe_mode guarantee; safe_mode=False keeps its trust premise.
+        _verify_shared_dimension_values(
+            session, URLs, results, dmr_urls[0], skip_dim=concat_dim
+        )
     else:
         #  Caches a single dmr and creates a cache key for all dmr urls
         #  to avoid downloading multiple dmr responses.
@@ -475,6 +493,67 @@ def consolidate_metadata(
         max_workers = min(len(new_urls), 32)
         _ = download_all_urls(session_state, new_urls, ncores=max_workers)
     return None
+
+
+def _verify_shared_dimension_values(
+    session, urls, empty_datasets, base_dmr_url, skip_dim=None
+):
+    """Compare non-concat coordinate *values* across granules (safe_mode).
+
+    Equal dimension lengths do not imply equal coordinates. This opens each
+    granule through the normal DAP4 machinery (so checksums are verified),
+    downloads only the coordinate variables backing the shared dimensions,
+    and raises ``ValueError`` naming the offending URL and dimension when the
+    values differ from the first granule.
+    """
+    # ``open_dmr`` only hydrates groups/dimensions; re-parse the cached DMR
+    # text fully to discover coordinate variables.
+    base_response = GET(base_dmr_url, session=session)
+    base = dmr_to_dataset(base_response.text)
+    # A coordinate variable is a 1-D BaseType whose sole dimension path equals
+    # its own variable path (e.g. var '/g/x' backed by dim '/g/x').
+    coord_paths = []
+    for name in list(base.variables()):
+        var = base[name]
+        if not isinstance(var, BaseType) or len(var.dims) != 1:
+            continue
+        if var.dims[0] != var.id:
+            continue
+        # skip_dim may be given as a leaf dimension name or a full path.
+        leaf = var.id.strip("/").split("/")[-1]
+        if skip_dim is not None and skip_dim in (var.id, leaf):
+            continue
+        coord_paths.append(var.id)
+    if not coord_paths:
+        return
+    base_url = base_dmr_url[:-4] if base_dmr_url.endswith(".dmr") else base_dmr_url
+    reference = open_url(base_url, session=session, protocol="dap4")
+    ref_values = {path: np.asarray(reference[path][...].data) for path in coord_paths}
+    for url in urls[1:]:
+        ds = open_url(url, session=session, protocol="dap4")
+        for path in coord_paths:
+            try:
+                other_var = ds[path]
+            except (KeyError, TypeError):
+                other_var = None
+            if not isinstance(other_var, BaseType):
+                raise ValueError(
+                    f"Coordinate variable {path!r} is missing from {url!r}; "
+                    "granules cannot be consolidated safely."
+                )
+            values = np.asarray(other_var[...].data)
+            ref = ref_values[path]
+            equal = (
+                np.array_equal(ref, values, equal_nan=True)
+                if ref.dtype.kind == "f"
+                else np.array_equal(ref, values)
+            )
+            if not equal:
+                raise ValueError(
+                    f"Dimension coordinate {path!r} values differ between "
+                    f"{urls[0]!r} and {url!r} even though their lengths match; "
+                    "refusing to consolidate in safe_mode."
+                )
 
 
 def fetch_dim(url, session_state, timeout=30):
@@ -1928,6 +2007,7 @@ def to_netcdf(
     dim_slices: Optional[
         Union[Mapping[str, SliceTuple], Sequence[Mapping[str, SliceTuple]]]
     ] = None,
+    output_file: Optional[Union[str, Path]] = None,
 ) -> None:
     """
     Downloads multiple dap4 responses in parallel, and stores them to a local directory.
@@ -1938,7 +2018,24 @@ def to_netcdf(
 
     If data is behind authentication (e.g EDL), make sure to provide session with auth
     or have a .netrc with proper credentials correctly in place.
+
+    A multi-file view produced by :func:`open_mfdataset` is also accepted as the
+    first argument. In that case a single, already-merged NetCDF file is written
+    to ``output_file`` (or ``output_path`` when ``output_file`` is not given),
+    streaming the dynamic variables through the view's buffer-budgeted proxy.
     """
+    # Multi-file view: write one merged file.
+    from pydap.multifile import MultiFileDataset
+
+    if isinstance(urls, MultiFileDataset):
+        target = output_file or output_path
+        if target is None:
+            raise ValueError(
+                "Writing a multi-file view requires `output_file` (or "
+                "`output_path`) naming the merged NetCDF destination."
+            )
+        return urls.write_merged_netcdf(target)
+
     if session:
         session_state = extract_session_state(session)
     else:
@@ -1999,6 +2096,34 @@ def to_netcdf(
         max_workers_first=max_workers,
         max_workers_retry=8,
         backoff_seconds=10.0,
+    )
+
+
+def open_mfdataset(
+    urls,
+    *,
+    concat_dim,
+    keep_variables,
+    overlap="error",
+    session=None,
+    max_buffer_bytes=8388608,
+):
+    """Open a lazy, concatenated view over multiple DAP4 granule URLs.
+
+    See :func:`pydap.multifile.open_mfdataset` for the full description of
+    parameters, semantics and resource management. The returned object is a
+    :class:`~pydap.model.DatasetType`-compatible, closeable view supporting
+    the ``with`` statement.
+    """
+    from pydap.multifile import open_mfdataset as _open_mfdataset
+
+    return _open_mfdataset(
+        urls,
+        concat_dim=concat_dim,
+        keep_variables=keep_variables,
+        overlap=overlap,
+        session=session,
+        max_buffer_bytes=max_buffer_bytes,
     )
 
 

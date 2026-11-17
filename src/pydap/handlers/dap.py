@@ -18,6 +18,7 @@ import re
 import sys
 import tempfile
 import warnings
+import zlib
 from io import BufferedReader, BytesIO
 from itertools import chain
 from pathlib import Path
@@ -29,6 +30,10 @@ import requests_cache
 from requests.utils import urlparse, urlunparse
 from webob.response import Response as webob_Response
 
+from pydap.exceptions import (
+    DAP4ChecksumError,
+    DAP4TruncatedResponseError,
+)
 from pydap.handlers.lib import BaseHandler, ConstraintExpression, IterData
 from pydap.lib import (
     DAP2_ARRAY_LENGTH_NUMPY_TYPE,
@@ -1002,11 +1007,22 @@ def stream2bytearray(data):
     offset = data.data.tell()  # current position in the stream
     last = False
     while not last:
-        # Read the chunk header
-        chunk_header = numpy.frombuffer(data.slice(offset=offset, n=4), dtype=">u4")[0]
+        # Read the chunk header; a short read means the stream was cut off
+        # before a complete chunk header arrived.
+        header_bytes = data.slice(offset=offset, n=4)
+        if len(header_bytes) < 4:
+            raise DAP4TruncatedResponseError(
+                "DAP4 response is truncated: expected a 4-byte chunk header at "
+                f"offset {offset}, got {len(header_bytes)} byte(s)."
+            )
+        chunk_header = numpy.frombuffer(header_bytes, dtype=">u4")[0]
         chunk_size = chunk_header & 0x00FFFFFF
         chunk_type = (chunk_header >> 24) & 0xFF
-        last, _, _ = decode_chunktype(chunk_type)
+        last, error_chunk, _ = decode_chunktype(chunk_type)
+        if error_chunk:
+            raise DAP4TruncatedResponseError(
+                "DAP4 response contains a chunk flagged as an error chunk."
+            )
         chunk_positions.append((offset + 4, chunk_size))
         offset += 4 + chunk_size
         if last:
@@ -1015,13 +1031,57 @@ def stream2bytearray(data):
     results = []
     for offset, length in chunk_positions:
         data.data.seek(offset)
-        results.append(data.data.read(length))
+        chunk_data = data.data.read(length)
+        if len(chunk_data) < length:
+            raise DAP4TruncatedResponseError(
+                "DAP4 response is truncated: expected a data chunk of "
+                f"{length} byte(s) at offset {offset}, got {len(chunk_data)}."
+            )
+        results.append(chunk_data)
 
     buffer = bytearray()
     # Combine results
     for chunk_data in results:
         buffer.extend(chunk_data)
     return buffer
+
+
+def verify_dap4_checksum(variable, payload, raw_checksum):
+    """Verify a DAP4 per-variable CRC32 checksum.
+
+    DAP4 carries a standard CRC32 (the same polynomial as
+    :func:`zlib.crc32`) for every variable, serialized in little-endian byte
+    order immediately after the variable payload.
+
+    Parameters
+    ----------
+    variable : BaseType
+        The variable being checked, used only for error messages.
+    payload : bytes
+        The exact (post chunk-reassembly) binary payload of the variable.
+    raw_checksum : bytes
+        The four checksum bytes as received on the wire.
+
+    Raises
+    ------
+    DAP4ChecksumError
+        If the received checksum does not match the computed checksum.
+    DAP4TruncatedResponseError
+        If fewer than four checksum bytes were available.
+    """
+    if len(raw_checksum) < 4:
+        raise DAP4TruncatedResponseError(
+            "DAP4 response is truncated while reading the checksum for "
+            f"variable {getattr(variable, 'id', '?')!r}."
+        )
+    expected = int(numpy.frombuffer(raw_checksum[:4], dtype="<u4")[0])
+    actual = zlib.crc32(bytes(payload)) & 0xFFFFFFFF
+    if actual != expected:
+        raise DAP4ChecksumError(
+            "DAP4 checksum verification failed for variable "
+            f"{getattr(variable, 'id', '?')!r}: received "
+            f"0x{expected:08x}, computed 0x{actual:08x}."
+        )
 
 
 def get_endianness(chunk_header):
@@ -1132,7 +1192,12 @@ class UNPACKDAP4DATA(object):
             dmr, data, endianness
         """
         # decode the first 4 bytes are CRLF
-        chunk_header = numpy.frombuffer(self.raw.read(4), dtype=">u4")[0]
+        header_bytes = self.raw.read(4)
+        if len(header_bytes) < 4:
+            raise DAP4TruncatedResponseError(
+                "DAP4 response is truncated before the initial DMR chunk header."
+            )
+        chunk_header = numpy.frombuffer(header_bytes, dtype=">u4")[0]
         dmr_length = chunk_header & 0x00FFFFFF
         chunk_type = (chunk_header >> 24) & 0xFF
         if isinstance(self.r, webob_Response):
@@ -1331,7 +1396,6 @@ class UNPACKDAP4DATA(object):
         (BaseType only) with data that is currently in binary form (within a dap
         response).
         """
-        checksum_dtype = numpy.dtype(self.endianness + "u4")
         buffer = stream2bytearray(self.raw)
         start = 0
         for variable in walk(dataset, BaseType):
@@ -1341,6 +1405,15 @@ class UNPACKDAP4DATA(object):
                 variable=variable,
                 endian=self.endianness,
             )
+            if self.checksums:
+                # DAP4 per-variable checksums are CRC32 values serialized in
+                # little-endian byte order, immediately after the payload.
+                raw_checksum = bytes(buffer[stop : stop + 4])
+                payload = bytes(buffer[start:stop])
+                verify_dap4_checksum(variable, payload, raw_checksum)
+                checksum = numpy.frombuffer(raw_checksum, dtype="<u4")
+                variable.attributes["_DAP4_Checksum_CRC32"] = checksum[0]
+
             if self.nc is not None:
                 name = variable.id.split("/")[-1]
                 if isinstance(variable.parent, DatasetType):
@@ -1352,14 +1425,9 @@ class UNPACKDAP4DATA(object):
                 variable._set_data(None)
             else:
                 variable._set_data(data)
-            if self.checksums:
-                checksum = numpy.frombuffer(
-                    buffer[stop : stop + 4], dtype=checksum_dtype
-                )
-                variable.attributes["_DAP4_Checksum_CRC32"] = checksum[0]
 
-            # Jump over the 4 byte chunk_header
-            start = stop + 4
+            # Jump over the 4 byte checksum (when checksums are present)
+            start = stop + (4 if self.checksums else 0)
         if self.nc is not None:
             self.nc.close()
         return dataset

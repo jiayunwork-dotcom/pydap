@@ -1,6 +1,33 @@
 News
 ====
 
+3.5.9
+-----
+
+* Cross-file DAP4 views
+  * New `pydap.client.open_mfdataset(urls, *, concat_dim, keep_variables,
+    overlap='error', session=None, max_buffer_bytes=8388608)` opens a lazy,
+    closeable, `DatasetType`-compatible view concatenating multiple DAP4
+    granules along a numeric coordinate dimension, without an xarray
+    dependency or downloading whole granules.
+  * Coordinates are merged in ascending order with exact int64/float64
+    comparisons (integers above `2**53` stay distinct) and `error`/`first`/
+    `last` policies for cross-file duplicate coordinates; the chosen source
+    decides whole rows of every kept variable.
+  * Full metadata compatibility checks (dtype, dimension sets/lengths,
+    coordinate values, units/calendar/fill/scale/offset, static values),
+    axis-order tolerance following the first URL, group-scoped dimensions,
+    multi-axis integer/slice/negative-step indexing, and buffer-budgeted
+    dynamic payloads.
+  * `to_netcdf` accepts a view plus `output_file` to stream one merged
+    NetCDF4 file with atomic replacement; existing single/multi-URL styles
+    are unchanged.
+  * DAP4 per-variable CRC32 checksums are now verified and truncated
+    responses raise instead of returning partial arrays.
+  * `consolidate_metadata(..., safe_mode=True)` now compares shared
+    coordinate *values*, not only dimension lengths; `http://` sources are
+    accepted for local testing.
+
 3.4.0
 -----
 
