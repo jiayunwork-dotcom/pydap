@@ -45,6 +45,10 @@ pydap = "pydap.wsgi.app:main"
 [project.entry-points."pydap.function"]
 bounds = "pydap.wsgi.functions:bounds"
 density = "pydap.wsgi.functions:density"
+group_reduce = "pydap.wsgi.group_reduce:group_reduce"
+where = "pydap.wsgi.group_reduce:where"
+select = "pydap.wsgi.group_reduce:select"
+limit = "pydap.wsgi.group_reduce:limit"
 mean = "pydap.wsgi.functions:mean"
 
 [project.entry-points."pydap.handler"]

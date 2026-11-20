@@ -46,6 +46,8 @@ lazy mechanism for function call, supporting any function. Eg, to call the
 
 import datetime as dt
 import hashlib
+import json
+import math
 import multiprocessing as mp
 import os
 import re
@@ -76,6 +78,7 @@ from pydap.handlers.dap import (
     StreamReader,
     unpack_dap2_data,
 )
+from pydap.exceptions import ConstraintExpressionError
 from pydap.lib import DEFAULT_TIMEOUT, Failure, _is_retryable, encode, tqdm, walk
 from pydap.model import BaseType, BatchPromise, DapType
 from pydap.net import (
@@ -707,8 +710,16 @@ def open_dods_url(
 
     r = GET(url, application, session, timeout=timeout)
 
-    dds, data = r.body.split(b"\nData:\n", 1)
-    dds = dds.decode(r.content_encoding or "ascii")
+    # Local WSGI transports return a webob response (``.body``,
+    # ``.content_encoding``); real HTTP returns a requests response
+    # (``.content``, ``.encoding``). Support both uniformly.
+    body = getattr(r, "body", None)
+    if body is None:
+        body = r.content
+    encoding = getattr(r, "content_encoding", None) or "ascii"
+
+    dds, data = body.split(b"\nData:\n", 1)
+    dds = dds.decode(encoding)
     dataset = dds_to_dataset(dds)
     stream = StreamReader(BytesIO(data))
     dataset.data = unpack_dap2_data(stream, dataset)
@@ -738,6 +749,14 @@ class Functions(object):
         self.timeout = timeout
 
     def __getattr__(self, attr):
+        if attr in ("group_reduce", "where", "select", "limit"):
+            return GroupServerFunction(
+                self.baseurl,
+                attr,
+                self.application,
+                self.session,
+                timeout=self.timeout,
+            )
         return ServerFunction(
             self.baseurl, attr, self.application, self.session, timeout=self.timeout
         )
@@ -807,6 +826,290 @@ class ServerFunctionResult(object):
 
     def __getattr__(self, name):
         return self[name]
+
+
+# ---------------------------------------------------------------------------
+# Lazy grouped-aggregation views (group_reduce / where / select / limit)
+# ---------------------------------------------------------------------------
+
+
+def _dap_quote_string(value):
+    """Encode a python string as a DAP2 double-quoted function argument."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _compact_json(payload):
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
+def result_field(name):
+    """Reference a column of a grouped-query ``summary`` result.
+
+    Use inside :func:`result_condition`, e.g.
+    ``result_condition(view.field("mean_v"), ">", 1.5)``.
+    """
+    return _ResultColumn(name)
+
+
+class _ResultColumn:
+    """A symbolic reference to a summary column used in predicates."""
+
+    def __init__(self, name):
+        if not isinstance(name, str) or not name:
+            raise ValueError("result field names must be non-empty strings.")
+        self.name = name
+
+    def _cmp(self, op, value):
+        return result_condition(self, op, value)
+
+    def __eq__(self, other):
+        return self._cmp("=", other)
+
+    def __ne__(self, other):
+        return self._cmp("!=", other)
+
+    def __lt__(self, other):
+        return self._cmp("<", other)
+
+    def __le__(self, other):
+        return self._cmp("<=", other)
+
+    def __gt__(self, other):
+        return self._cmp(">", other)
+
+    def __ge__(self, other):
+        return self._cmp(">=", other)
+
+    def __hash__(self):
+        return hash(("_ResultColumn", self.name))
+
+
+def result_condition(field, op, value):
+    """Build a comparison predicate on a summary result column.
+
+    ``field`` is either a :class:`_ResultColumn` or a plain column name.
+    ``value`` must be a string or a finite numeric (booleans rejected).
+    """
+    if isinstance(field, _ResultColumn):
+        name = field.name
+    elif isinstance(field, str) and field:
+        name = field
+    else:
+        raise TypeError("condition field must be a result field or column name.")
+    if op not in ("=", "!=", "<", "<=", ">", ">="):
+        raise ValueError("unsupported comparison operator %r" % op)
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise TypeError("condition value must be a string or a finite number.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("condition value must be finite.")
+    return {"kind": "cmp", "field": name, "op": op, "value": value}
+
+
+def combine_conditions(*predicates):
+    """Combine predicates with logical AND."""
+    if not predicates:
+        raise ValueError("combine_conditions requires at least one predicate.")
+    flattened = []
+    for predicate in predicates:
+        if not isinstance(predicate, dict):
+            raise TypeError("predicates must be built with result_condition.")
+        if predicate.get("kind") == "and":
+            flattened.extend(predicate["predicates"])
+        else:
+            flattened.append(predicate)
+    return {"kind": "and", "predicates": flattened}
+
+
+class GroupServerFunction(object):
+    """Proxy for the grouped-aggregation server-side functions."""
+
+    def __init__(
+        self,
+        baseurl,
+        name,
+        application=None,
+        session=None,
+        timeout=DEFAULT_TIMEOUT,
+    ):
+        self.baseurl = baseurl
+        self.name = name
+        self.application = application
+        self.session = session
+        self.timeout = timeout
+
+    def __call__(self, *args):
+        rendered = []
+        for arg in args:
+            rendered.append(self._render(arg))
+        call_id = self.name + "(" + ",".join(rendered) + ")"
+        return LazyFunctionResult(
+            self.baseurl,
+            call_id,
+            self.application,
+            self.session,
+            timeout=self.timeout,
+        )
+
+    def _render(self, arg):
+        if isinstance(arg, LazyFunctionResult):
+            return arg.id
+        if isinstance(arg, (DapType, ServerFunctionResult)):
+            return arg.id
+        if isinstance(arg, str):
+            return _dap_quote_string(arg)
+        if isinstance(arg, bool):
+            raise TypeError("booleans are not valid function arguments.")
+        if isinstance(arg, int):
+            return str(arg)
+        if isinstance(arg, float):
+            if not math.isfinite(arg):
+                raise ValueError("numeric arguments must be finite.")
+            return repr(arg)
+        return encode(arg)
+
+
+class LazyFunctionResult(object):
+    """An independent, lazy view over a grouped-query function result.
+
+    Constructing a view never performs a request. The first field access
+    (typically ``view["summary"]``) issues a single ``.dods`` request whose
+    constraint expression carries the whole staged pipeline. Each derived
+    view keeps its own materialised result; two views never share data.
+    """
+
+    def __init__(
+        self,
+        baseurl,
+        call_id,
+        application=None,
+        session=None,
+        timeout=DEFAULT_TIMEOUT,
+        columns=None,
+    ):
+        self.id = call_id
+        self.application = application
+        self.session = session
+        self.timeout = timeout
+        self.dataset = None
+        # Ordered summary columns currently visible through this view.
+        # ``None`` means "not tracked yet" (e.g. views created outside the
+        # staged helpers); validation then happens on the server.
+        self._columns = list(columns) if columns is not None else None
+
+        scheme, netloc, path, params, query, fragment = urlparse(baseurl)
+        # Percent-encode the full CE so quoted JSON payloads containing
+        # ``&``, commas, parentheses or non-ASCII characters survive both
+        # real HTTP and the local WSGI transport intact.
+        encoded_ce = requests.utils.quote(call_id, safe="")
+        self.url = urlunparse(
+            (scheme, netloc, path + ".dods", params, encoded_ce, None)
+        )
+
+    # -- lazy stage constructors, each returning an independent view ------
+
+    def where(self, expression):
+        """Filter the summary with a predicate or AND-combined predicates."""
+        if isinstance(expression, list):
+            expression = combine_conditions(*expression)
+        if not isinstance(expression, dict):
+            raise TypeError(
+                "where() expects a predicate from result_condition(), or a "
+                "list of predicates."
+            )
+        self._validate_predicate_columns(expression)
+        payload = _dap_quote_string(_compact_json(expression))
+        return self._derive("where(%s,%s)" % (self.id, payload), self._columns)
+
+    def select(self, *fields):
+        """Project the summary to the given columns, in the given order."""
+        names = []
+        for field in fields:
+            if isinstance(field, _ResultColumn):
+                names.append(field.name)
+            elif isinstance(field, str) and field:
+                names.append(field)
+            else:
+                raise TypeError("select() fields must be column name strings.")
+        if not names:
+            raise ValueError("select() requires at least one column.")
+        if self._columns is not None:
+            unknown = [name for name in names if name not in self._columns]
+            if unknown:
+                raise ConstraintExpressionError(
+                    "select references column(s) not present in the current "
+                    "view: %s; available columns: %s"
+                    % (unknown, self._columns)
+                )
+        payload = _dap_quote_string(_compact_json(names))
+        return self._derive(
+            "select(%s,%s)" % (self.id, payload), list(names)
+        )
+
+    def limit(self, n, offset=0):
+        """Take ``n`` rows (after skipping ``offset``) in result order."""
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise TypeError("limit n must be a non-negative integer (not bool).")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise TypeError(
+                "limit offset must be a non-negative integer (not bool)."
+            )
+        return self._derive(
+            "limit(%s,%d,%d)" % (self.id, n, offset), self._columns
+        )
+
+    def field(self, name):
+        """Return a symbolic summary-column reference for predicates."""
+        return _ResultColumn(name)
+
+    def _validate_predicate_columns(self, predicate):
+        if self._columns is None:
+            return
+        if predicate.get("kind") == "and":
+            for sub in predicate["predicates"]:
+                self._validate_predicate_columns(sub)
+            return
+        name = predicate.get("field")
+        if name not in self._columns:
+            raise ConstraintExpressionError(
+                "where references column %r that is not present in the "
+                "current view; available columns: %s" % (name, self._columns)
+            )
+
+    def _derive(self, call_id, columns):
+        return LazyFunctionResult(
+            # baseurl is only used for its scheme/netloc/path components.
+            self._baseurl(),
+            call_id,
+            self.application,
+            self.session,
+            timeout=self.timeout,
+            columns=columns,
+        )
+
+    def _baseurl(self):
+        scheme, netloc, path, _, _, _ = urlparse(self.url)
+        if path.endswith(".dods"):
+            path = path[: -len(".dods")]
+        return urlunparse((scheme, netloc, path, "", "", ""))
+
+    # -- materialisation ---------------------------------------------------
+
+    def _fetch(self):
+        if self.dataset is None:
+            self.dataset = open_dods_url(
+                self.url, True, self.application, self.session, self.timeout
+            )
+        return self.dataset
+
+    def __getitem__(self, key):
+        return self._fetch()[key]
+
+    def __getattr__(self, name):
+        # ``__getattr__`` only runs for names not found normally, so internal
+        # attributes never get mistaken for result columns.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._fetch()[name]
 
 
 def compute_base_url_prefix(url_list):

@@ -1,0 +1,62 @@
+[
+  {
+    "rows_in": 100000,
+    "groups_out": 8,
+    "scenario": "few_groups",
+    "max_groups_setting": 32,
+    "source_traversals": 1,
+    "peak_resident_groups": 8,
+    "spill_count": 0,
+    "peak_disk_bytes": 0,
+    "tracemalloc_peak_bytes": 918820,
+    "rss_peak_kib_before": 50748,
+    "rss_peak_kib_after": 53952,
+    "first_result_seconds": 1.4278,
+    "total_seconds": 1.4279
+  },
+  {
+    "rows_in": 100000,
+    "groups_out": 8,
+    "scenario": "few_groups",
+    "max_groups_setting": 256,
+    "source_traversals": 1,
+    "peak_resident_groups": 8,
+    "spill_count": 0,
+    "peak_disk_bytes": 0,
+    "tracemalloc_peak_bytes": 115724,
+    "rss_peak_kib_before": 54080,
+    "rss_peak_kib_after": 54080,
+    "first_result_seconds": 1.5683,
+    "total_seconds": 1.5684
+  },
+  {
+    "rows_in": 100000,
+    "groups_out": 100000,
+    "scenario": "all_distinct",
+    "max_groups_setting": 32,
+    "source_traversals": 1,
+    "peak_resident_groups": 32,
+    "spill_count": 3124,
+    "peak_disk_bytes": 13917312,
+    "tracemalloc_peak_bytes": 1712326,
+    "rss_peak_kib_before": 54080,
+    "rss_peak_kib_after": 57280,
+    "first_result_seconds": 3.7965,
+    "total_seconds": 5.4128
+  },
+  {
+    "rows_in": 100000,
+    "groups_out": 100000,
+    "scenario": "all_distinct",
+    "max_groups_setting": 256,
+    "source_traversals": 1,
+    "peak_resident_groups": 256,
+    "spill_count": 390,
+    "peak_disk_bytes": 13347072,
+    "tracemalloc_peak_bytes": 2640929,
+    "rss_peak_kib_before": 57280,
+    "rss_peak_kib_after": 58164,
+    "first_result_seconds": 2.1649,
+    "total_seconds": 3.7982
+  }
+]

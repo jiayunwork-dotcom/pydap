@@ -40,6 +40,8 @@ parts:
     - file: ConstraintExpressions
   - file: responses.rst
   - file: server.rst
+  - file: group_reduce.rst
+  - file: group_reduce_design.rst
   - file: handlers.rst
 - caption: Guide for Developer
   chapters:

@@ -123,10 +123,15 @@ def _sequencetype(var):
                 padded = []
                 for value in record:
                     if isinstance(value, str):
-                        length = len(value) or 1
+                        # DAP2 strings are transported as length-prefixed
+                        # bytes; use UTF-8 so non-ASCII characters round-trip.
+                        encoded = value.encode("utf-8")
+                        length = len(encoded) or 1
                         out.append(length)
                         padded.append(length + (-length % 4))
-                    out.append(value)
+                        out.append(encoded)
+                    else:
+                        out.append(value)
                 record = out
                 DAP2_dtype_str = ",".join(DAP2_types).format(*padded)
 
@@ -213,9 +218,10 @@ def _basetype(var):
                     yield tostring_with_byteorder(
                         np.array(length), np.dtype(DAP2_ARRAY_LENGTH_NUMPY_TYPE)
                     )
-                    # byteorder is not important for strings:
+                    # byteorder is not important for strings; encode as UTF-8
+                    # so non-ASCII characters round-trip through DAP2.
                     if hasattr(word, "encode"):
-                        yield word.encode("ascii")
+                        yield word.encode("utf-8")
                     elif hasattr(word, "tobytes"):
                         yield word.tobytes()
                     else:

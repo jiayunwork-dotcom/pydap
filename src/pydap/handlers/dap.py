@@ -848,7 +848,7 @@ def convert_stream_to_list(stream, parser_dtype, shape, id):
                 data.append(stream.read(k))
                 stream.read(-k % 4)
             out.append(
-                numpy.array([str(x.decode("ascii")) for x in data], "S").reshape(shape)
+                numpy.array([x.decode("utf-8") for x in data], "S").reshape(shape)
             )
         else:
             stream.read(4)  # read additional length
@@ -882,7 +882,7 @@ def convert_stream_to_list(stream, parser_dtype, shape, id):
         # response_dtype.char should never be
         # 'U'
         k = numpy.frombuffer(stream.read(4), DAP2_ARRAY_LENGTH_NUMPY_TYPE)[0]
-        out.append(str(stream.read(k).decode("ascii")))
+        out.append(stream.read(k).decode("utf-8"))
         stream.read(-k % 4)
     # usual data
     else:

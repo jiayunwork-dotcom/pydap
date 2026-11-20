@@ -27,6 +27,22 @@ News
   * `consolidate_metadata(..., safe_mode=True)` now compares shared
     coordinate *values*, not only dimension lengths; `http://` sources are
     accepted for local testing.
+* Server-side grouped aggregation
+  * New server function `group_reduce(sequence, keys_json, aggregates_json)`
+    groups a flat DAP2 `Sequence` by key columns and computes `count`,
+    `sum`, `mean`, `min` and `max` on the server, returning a `summary`
+    `Sequence` (`Int32` counts, `Float64` other aggregates). Input is
+    traversed once; simultaneously resident group states are bounded by the
+    new `ServerSideFunctions` options `group_reduce_max_groups=1024` and
+    `group_reduce_tempdir=None`, with sorted spill files and batched merge
+    passes for near-all-distinct keys.
+  * Lazy, order-preserving client views add `where(expression)` (comparisons
+    and AND over the grouped result), `select(*fields)` (projection) and
+    `limit(n, offset=0)` (row window). The stages are encoded as replayable
+    DAP2 function-call constraint expressions and executed entirely on the
+    server; view creation sends no request.
+  * DAP2 string transport now uses UTF-8 so non-ASCII string keys and
+    constants round-trip through DDS/DODS responses.
 
 3.4.0
 -----
